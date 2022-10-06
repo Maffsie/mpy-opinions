@@ -2,6 +2,9 @@ from machine import I2C, Pin
 from micropython import const
 
 class I2CPeripheral:
+    """
+    Slim class intended to be subclassed by I2C device drivers
+    """
     default_address: int = const(0)
     
     def __init__(self, bus: I2C = None, address: int = None, *args, **kwargs):
