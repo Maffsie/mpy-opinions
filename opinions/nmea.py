@@ -1,14 +1,88 @@
 from math import floor, modf
 
 try:
-    import utime
+    from utime import ticks_ms as tm
 except ImportError:
-    import time
+    from time import time as tm
 
 
-class NMEAParser(object):
-    """GPS NMEA Sentence Parser. Creates object that stores all relevant GPS data and statistics.
-    Parses sentences one character at a time using update(). """
+class NMEAState:
+    crc = None
+    chars = 0
+    segments = []
+    active_segment = 0
+
+    def __init__(self):
+        self.active_segment = 0
+        self.chars = 0
+        self.crc = None
+        self.segments = []
+
+
+class NMEALifecycleStatistics:
+    crcs_failed: int = 0
+    sentences: int = 0
+    sentences_parsed: int = 0
+
+    def __init__(self):
+        self.crcs_failed = 0
+        self.sentences = 0
+        self.sentences_parsed = 0
+
+
+class NMEAActiveState:
+    """
+    Active state based on parsed NMEA sentences
+    """
+    dt_y: int = 0
+    dt_M: int = 0
+    dt_d: int = 0
+    dt_h: int = 0
+    dt_m: int = 0
+    dt_s: float = 0.0
+
+    lt_d: int = 0
+    lt_m: float = 0.0
+    lt_h: str = ''
+    ln_d: int = 0
+    ln_m: float = 0.0
+    ln_h: str = ''
+
+    sp: float = 0.0
+    dr: float = 0.0
+
+    as_v: int = 0
+    as_u: int = 0
+    as_l: list[dict] = []
+
+    pr_p: int = 0
+    pr_h: int = 0
+    pr_v: int = 0
+
+    fix: bool = False
+    fix_tm: int = 0
+
+    def __init__(self):
+        self.dt_y, self.dt_M, self.dt_d = 0, 0, 0
+        self.dt_h, self.dt_m, self.dt_s = 0, 0, 0.0
+        self.lt_d, self.lt_m, self.lt_h = 0, 0.0, ''
+        self.ln_d, self.ln_m, self.ln_h = 0, 0.0, ''
+        self.sp, self.dr = 0.0, 0.0
+        self.as_v, self.as_u, self.pr_p, self.pr_h, self.pr_v = 0, 0, 0, 0, 0
+        self.as_l = []
+
+        self.fix = False
+        self.fix_tm = 0
+
+
+class NMEAParser:
+    """
+    NMEA sentence parser
+    """
+
+    active: NMEAActiveState = None
+    state: NMEAState = None
+    stats: NMEALifecycleStatistics = None
 
     # Max Number of Characters a valid sentence can be (based on GGA sentence)
     SENTENCE_LIMIT = 90
@@ -32,130 +106,19 @@ class NMEAParser(object):
                                        Decimal Degrees (dd) - 40.446° N
         """
 
-        #####################
-        # Object Status Flags
-        self.sentence_active = False
-        self.active_segment = 0
-        self.process_crc = False
-        self.gps_segments = []
-        self.crc_xor = 0
-        self.char_count = 0
-        self.fix_time = 0
+        self.active = NMEAActiveState()
+        self.state = None
+        self.stats = NMEALifecycleStatistics()
 
-        #####################
-        # Sentence Statistics
-        self.crc_fails = 0
-        self.clean_sentences = 0
-        self.parsed_sentences = 0
-
-        #####################
-        # Logging Related
-        self.log_handle = None
-        self.log_en = False
-
-        #####################
-        # Data From Sentences
-        # Time
-        self.timestamp = [0, 0, 0.0]
-        self.date = [0, 0, 0]
         self.local_offset = local_offset
-
-        # Position/Motion
-        self._latitude = [0, 0.0, 'N']
-        self._longitude = [0, 0.0, 'W']
         self.coord_format = location_formatting
-        self.speed = [0.0, 0.0, 0.0]
-        self.course = 0.0
         self.altitude = 0.0
         self.geoid_height = 0.0
-
-        # GPS Info
-        self.satellites_in_view = 0
-        self.satellites_in_use = 0
-        self.satellites_used = []
         self.last_sv_sentence = 0
         self.total_sv_sentences = 0
-        self.satellite_data = dict()
-        self.hdop = 0.0
-        self.pdop = 0.0
-        self.vdop = 0.0
-        self.valid = False
         self.fix_stat = 0
         self.fix_type = 1
 
-    ########################################
-    # Coordinates Translation Functions
-    ########################################
-    @property
-    def latitude(self):
-        """Format Latitude Data Correctly"""
-        if self.coord_format == 'dd':
-            decimal_degrees = self._latitude[0] + (self._latitude[1] / 60)
-            return [decimal_degrees, self._latitude[2]]
-        elif self.coord_format == 'dms':
-            minute_parts = modf(self._latitude[1])
-            seconds = round(minute_parts[0] * 60)
-            return [self._latitude[0], int(minute_parts[1]), seconds, self._latitude[2]]
-        else:
-            return self._latitude
-
-    @property
-    def longitude(self):
-        """Format Longitude Data Correctly"""
-        if self.coord_format == 'dd':
-            decimal_degrees = self._longitude[0] + (self._longitude[1] / 60)
-            return [decimal_degrees, self._longitude[2]]
-        elif self.coord_format == 'dms':
-            minute_parts = modf(self._longitude[1])
-            seconds = round(minute_parts[0] * 60)
-            return [self._longitude[0], int(minute_parts[1]), seconds, self._longitude[2]]
-        else:
-            return self._longitude
-
-    ########################################
-    # Logging Related Functions
-    ########################################
-    def start_logging(self, target_file, mode="append"):
-        """
-        Create GPS data log object
-        """
-        # Set Write Mode Overwrite or Append
-        mode_code = 'w' if mode == 'new' else 'a'
-
-        try:
-            self.log_handle = open(target_file, mode_code)
-        except AttributeError:
-            print("Invalid FileName")
-            return False
-
-        self.log_en = True
-        return True
-
-    def stop_logging(self):
-        """
-        Closes the log file handler and disables further logging
-        """
-        try:
-            self.log_handle.close()
-        except AttributeError:
-            print("Invalid Handle")
-            return False
-
-        self.log_en = False
-        return True
-
-    def write_log(self, log_string):
-        """Attempts to write the last valid NMEA sentence character to the active file handler
-        """
-        try:
-            self.log_handle.write(log_string)
-        except TypeError:
-            return False
-        return True
-
-    ########################################
-    # Sentence Parsers
-    ########################################
     def gprmc(self):
         """Parse Recommended Minimum Specific GPS/Transit data (RMC)Sentence.
         Updates UTC timestamp, latitude, longitude, Course, Speed, Date, and fix status
@@ -523,31 +486,19 @@ class NMEAParser(object):
 
         return True
 
-    ##########################################
-    # Data Stream Handler Functions
-    ##########################################
-
-    def new_sentence(self):
-        """Adjust Object Flags in Preparation for a New Sentence"""
-        self.gps_segments = ['']
-        self.active_segment = 0
-        self.crc_xor = 0
-        self.sentence_active = True
-        self.process_crc = True
-        self.char_count = 0
-
-    def update(self, new_char):
-        """Process a new input char and updates GPS object if necessary based on special characters ('$', ',', '*')
-        Function builds a list of received string that are validate by CRC prior to parsing by the  appropriate
-        sentence function. Returns sentence type on successful parse, None otherwise"""
+    def update(self, in_c):
+        """
+        Processes the given character
+        """
 
         valid_sentence = False
-        if type(new_char) is bytes:
-            new_char = ord(new_char)
-        if type(new_char) is int:
-            new_char = chr(new_char)
+        if type(in_c) is bytes: in_c = ord(in_c)
+        if type(in_c) is int: in_c = chr(in_c)
 
-        if 10 <= ord(new_char) <= 126:
+        if not 10 <= ord(in_c) <= 126:
+            return False
+
+        if in_c == '$': self.state = NMEAState()
             self.char_count += 1
 
             # Write Character to log file if enabled
@@ -619,17 +570,15 @@ class NMEAParser(object):
     def new_fix_time(self):
         """Updates a high resolution counter with current time when fix is updated. Currently only triggered from
         GGA, GSA and RMC sentences"""
-        try:
-            self.fix_time = utime.ticks_ms()
-        except NameError:
-            self.fix_time = time.time()
+        self.fix_time = tm()
 
     #########################################
     # User Helper Functions
     # These functions make working with the GPS object data easier
     #########################################
 
-    def satellite_data_updated(self):
+    @property
+    def satellite_data_updated(self) -> bool:
         """
         Checks if the all the GSV sentences in a group have been read, making satellite data complete
         :return: boolean
@@ -737,67 +686,6 @@ class NMEAParser(object):
             speed_string = str(self.speed[2]) + ' km/h'
 
         return speed_string
-
-    def date_string(self, formatting='s_mdy', century='20'):
-        """
-        Creates a readable string of the current date.
-        Can select between long format: Januray 1st, 2014
-        or two short formats:
-        11/01/2014 (MM/DD/YYYY)
-        01/11/2014 (DD/MM/YYYY)
-        :param formatting: string 's_mdy', 's_dmy', or 'long'
-        :param century: int delineating the century the GPS data is from (19 for 19XX, 20 for 20XX)
-        :return: date_string  string with long or short format date
-        """
-
-        # Long Format Januray 1st, 2014
-        if formatting == 'long':
-            # Retrieve Month string from private set
-            month = self.__MONTHS[self.date[1] - 1]
-
-            # Determine Date Suffix
-            if self.date[0] in (1, 21, 31):
-                suffix = 'st'
-            elif self.date[0] in (2, 22):
-                suffix = 'nd'
-            elif self.date[0] == (3, 23):
-                suffix = 'rd'
-            else:
-                suffix = 'th'
-
-            day = str(self.date[0]) + suffix  # Create Day String
-
-            year = century + str(self.date[2])  # Create Year String
-
-            date_string = month + ' ' + day + ', ' + year  # Put it all together
-
-        else:
-            # Add leading zeros to day string if necessary
-            if self.date[0] < 10:
-                day = '0' + str(self.date[0])
-            else:
-                day = str(self.date[0])
-
-            # Add leading zeros to month string if necessary
-            if self.date[1] < 10:
-                month = '0' + str(self.date[1])
-            else:
-                month = str(self.date[1])
-
-            # Add leading zeros to year string if necessary
-            if self.date[2] < 10:
-                year = '0' + str(self.date[2])
-            else:
-                year = str(self.date[2])
-
-            # Build final string based on desired formatting
-            if formatting == 's_dmy':
-                date_string = day + '/' + month + '/' + year
-
-            else:  # Default date format
-                date_string = month + '/' + day + '/' + year
-
-        return date_string
 
     # All the currently supported NMEA sentences
     supported_sentences = {'GPRMC': gprmc, 'GLRMC': gprmc,
