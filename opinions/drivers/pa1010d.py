@@ -1,23 +1,25 @@
-from time import sleep_ms
-from micropython import const
 import _thread
+from time import sleep_ms
 
 from i2cp import I2CPeripheral
+from micropython import const
 from nmea import NMEAParser
+
 
 class PA1010D(I2CPeripheral):
     default_address: int = const(0x10)
     run_update_loop: bool = False
-    
+
     def init(self):
         self.lock = _thread.allocate_lock()
         self.nmea = NMEAParser()
-    
+
     def update_loop(self):
         with self.lock:
-            if self.run_update_loop: return False
+            if self.run_update_loop:
+                return False
         return _thread.start_new_thread(self.update, ())
-    
+
     def update(self):
         with self.lock:
             self.run_update_loop = True
@@ -33,5 +35,3 @@ class PA1010D(I2CPeripheral):
     @property
     def next_byte(self):
         return self._readfrom(0)
-
-        
